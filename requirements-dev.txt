@@ -1,0 +1,5 @@
+# Development and packaging dependencies for Vaani Windows Desktop Activity Tracker
+-r requirements.txt
+pyinstaller>=6.4.0
+requests>=2.31.0
+

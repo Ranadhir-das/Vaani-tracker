@@ -1,0 +1,13 @@
+{
+  "backend_url": "https://vaaniapp.co.in",
+  "idle_threshold_seconds": 60,
+  "heartbeat_interval_seconds": 30,
+  "sync_interval_seconds": 60,
+  "track_apps": true,
+  "log_level": "INFO",
+  "device_uuid": "00000000-0000-0000-0000-000000000000",
+  "auth_token": null,
+  "registered_employee_id": null,
+  "registered_employee_name": null
+}
+

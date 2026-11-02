@@ -1,0 +1,4 @@
+# Runtime dependencies for Vaani Windows Desktop Activity Tracker
+pillow>=10.0.0
+pystray>=0.19.5
+
