@@ -93,6 +93,7 @@ class TestEndToEndFlow(unittest.TestCase):
             device_uuid=self.config.device_uuid,
             bucket_duration_seconds=60,
             track_apps=True,
+            auth_manager=self.auth,
         )
 
         self.syncer = BackgroundSyncer(
@@ -132,12 +133,13 @@ class TestEndToEndFlow(unittest.TestCase):
             self.aggregator.tick(1.0)
 
         # Queue should now have 1 pending bucket
-        self.assertEqual(self.queue.get_pending_count(), 1)
+        emp_id = reg_resp["employee_id"]
+        self.assertEqual(self.queue.get_pending_count(employee_id=emp_id), 1)
 
         # 4. Sync bucket to backend
         sync_res = self.syncer.sync_pending_now()
         self.assertTrue(sync_res.success)
-        self.assertEqual(self.queue.get_pending_count(), 0)
+        self.assertEqual(self.queue.get_pending_count(employee_id=emp_id), 0)
 
         # 5. Verify server state
         with SERVER_STATE.lock:

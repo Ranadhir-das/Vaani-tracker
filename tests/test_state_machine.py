@@ -131,6 +131,99 @@ class TestTrackingStateMachine(unittest.TestCase):
         self.session_notifier.trigger_lock()
         self.assertEqual(transitions[-1], (TrackerState.IDLE, TrackerState.LOCKED))
 
+    def test_concurrent_state_transitions_are_serialized_and_ordered(self):
+        """Concurrent calls to state machine maintain contiguous, strictly-ordered transitions without gaps or duplicates."""
+        import threading
+        import time
+
+        self.sm.update_shift_status(ShiftInfo(session_id=1, status=ShiftStatus.ACTIVE))
+
+        transitions = []
+        errors = []
+        lock = threading.Lock()
+
+        def record_transition(old_s, new_s):
+            with lock:
+                transitions.append((old_s, new_s))
+
+        self.sm.add_state_listener(record_transition)
+
+        def worker_lock():
+            try:
+                for _ in range(20):
+                    self.session_notifier.trigger_lock()
+                    time.sleep(0.001)
+                    self.session_notifier.trigger_unlock()
+            except Exception as e:
+                errors.append(e)
+
+        def worker_power():
+            try:
+                for _ in range(20):
+                    self.power_notifier.trigger_suspend()
+                    time.sleep(0.001)
+                    self.power_notifier.trigger_resume()
+            except Exception as e:
+                errors.append(e)
+
+        def worker_idle():
+            try:
+                for i in range(20):
+                    self.mock_idle_seconds = 75.0 if i % 2 == 0 else 0.0
+                    self.sm.evaluate_state()
+                    time.sleep(0.001)
+            except Exception as e:
+                errors.append(e)
+
+        def worker_shifts():
+            try:
+                for i in range(20):
+                    st = ShiftStatus.PAUSED if i % 2 == 0 else ShiftStatus.ACTIVE
+                    self.sm.update_shift_status(ShiftInfo(session_id=1, status=st))
+                    time.sleep(0.001)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [
+            threading.Thread(target=worker_lock),
+            threading.Thread(target=worker_power),
+            threading.Thread(target=worker_idle),
+            threading.Thread(target=worker_shifts),
+        ]
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5.0)
+
+        self.assertEqual(len(errors), 0, f"Concurrent state updates caused errors: {errors}")
+
+        # Verify strict FIFO continuity: every transition's target must match next transition's source
+        self.assertGreater(len(transitions), 0)
+        for i in range(len(transitions) - 1):
+            cur_old, cur_new = transitions[i]
+            next_old, next_new = transitions[i + 1]
+            self.assertNotEqual(cur_old, cur_new, f"Transition {i} has identical states ({cur_old} -> {cur_new})")
+            self.assertEqual(cur_new, next_old, f"Discontinuity at index {i}: {cur_new} != {next_old}")
+
+    def test_reentrant_evaluate_state_from_listener_does_not_deadlock(self):
+        """A state listener calling evaluate_state() or current_state does not cause recursive deadlocks."""
+        reentrant_calls = []
+
+        def reentrant_listener(old_s, new_s):
+            # Read state inside listener
+            st = self.sm.current_state
+            reentrant_calls.append((old_s, new_s, st))
+            # Call evaluate_state reentrantly
+            self.sm.evaluate_state()
+
+        self.sm.add_state_listener(reentrant_listener)
+
+        # Trigger transition
+        self.sm.update_shift_status(ShiftInfo(session_id=1, status=ShiftStatus.ACTIVE))
+        self.assertEqual(self.sm.current_state, TrackerState.ACTIVE)
+        self.assertGreater(len(reentrant_calls), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,6 +3,8 @@
 A lightweight, privacy-first background activity tracker for Vaani employees.
 """
 
-__version__ = "1.0.0"
+from .constants import APP_VERSION
+
+__version__ = APP_VERSION
 __author__ = "Vaani Team"
 

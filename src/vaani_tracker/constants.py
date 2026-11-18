@@ -28,6 +28,7 @@ class ShiftStatus(str, Enum):
     ACTIVE = "ACTIVE"
     PAUSED = "PAUSED"
     COMPLETED = "COMPLETED"
+    NOT_STARTED = "NOT_STARTED"
     NONE = "NONE"
 
 
@@ -37,7 +38,12 @@ class SyncStatus(str, Enum):
     SYNCING = "SYNCING"
     SYNCED = "SYNCED"
     FAILED = "FAILED"
+    DEAD_LETTER = "DEAD_LETTER"
+    ORPHANED = "ORPHANED"
 
+
+# Application release metadata
+APP_VERSION = "1.0.0"
 
 # Operational defaults
 DEFAULT_IDLE_THRESHOLD_SECONDS = 60
@@ -53,11 +59,27 @@ DEFAULT_DB_FILE_NAME = "events.db"
 DEFAULT_CONFIG_FILE_NAME = "config.json"
 DEFAULT_LOG_FILE_NAME = "tracker.log"
 
+# Application named mutex for installer detection (AppMutex)
+APP_MUTEX_NAME = r"Local\VaaniDesktopTrackerRunning"
+
+# SQLite & Persistence Timeout Bounds
+DEFAULT_SQLITE_BUSY_TIMEOUT_MS = 5000
+SHUTDOWN_SQLITE_BUSY_TIMEOUT_MS = 3000
+SHUTDOWN_LOCK_TIMEOUT_SECONDS = 2.0
+SHUTDOWN_TEARDOWN_TIMEOUT_SECONDS = 10.0
+
 # Win32 Messages & Notification Codes
 WM_USER = 0x0400
 WM_TRAYICON = WM_USER + 1
 WM_WTSSESSION_CHANGE = 0x02B1
 WM_POWERBROADCAST = 0x0218
+WM_QUERYENDSESSION = 0x0011
+WM_ENDSESSION = 0x0016
+
+# Win32 EndSession reason codes
+ENDSESSION_CLOSEAPP = 0x00000001
+ENDSESSION_CRITICAL = 0x40000000
+ENDSESSION_LOGOFF = 0x80000000
 
 # WTS Session notification event codes
 WTS_CONSOLE_CONNECT = 0x1

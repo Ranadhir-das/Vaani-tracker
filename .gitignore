@@ -55,7 +55,3 @@ config.json
 .pytest_cache/
 .coverage
 htmlcov/
-
-# Packaging disabled for current development phase
-build_exe.py
-vaani_tracker.iss

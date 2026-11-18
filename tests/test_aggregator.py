@@ -47,6 +47,7 @@ class TestActivityAggregator(unittest.TestCase):
             device_uuid="dev-test-1",
             bucket_duration_seconds=60,
             track_apps=True,
+            employee_id=1,
         )
 
     def tearDown(self):
@@ -81,7 +82,7 @@ class TestActivityAggregator(unittest.TestCase):
         self.assertEqual(closed_bucket.session_id, 1)
 
         # Check queue
-        pending = self.queue.get_pending_buckets()
+        pending = self.queue.get_pending_buckets(employee_id=1)
         self.assertEqual(len(pending), 1)
         apps = {a.process_name: a.duration_seconds for a in pending[0].app_usages}
         self.assertEqual(apps.get("code.exe"), 45)
@@ -121,6 +122,82 @@ class TestActivityAggregator(unittest.TestCase):
         self.assertIsNotNone(bucket)
         self.assertEqual(bucket.session_id, 1)
         self.assertEqual(bucket.active_seconds, 20)
+
+    def test_tick_after_stop_returns_none_and_records_no_activity(self):
+        """R-1 Regression: Calling tick() after stop() must be a no-op and add zero database activity."""
+        self.sm.update_shift_status(ShiftInfo(session_id=1, status=ShiftStatus.ACTIVE))
+
+        # Accumulate 15 seconds
+        for _ in range(15):
+            self.aggregator.tick(1.0)
+
+        # Stop aggregator
+        self.aggregator.stop()
+
+        # Subsequent ticks after stop must return None and add zero buckets/activity
+        for _ in range(120):
+            res = self.aggregator.tick(1.0)
+            self.assertIsNone(res, "tick() after stop() must return None")
+
+        # Close in-progress bucket: closes the 15-second partial bucket
+        b1 = self.aggregator.close_current_bucket()
+        self.assertIsNotNone(b1)
+        self.assertEqual(b1.active_seconds, 15)
+
+        # Subsequent close_current_bucket calls return None
+        self.assertIsNone(self.aggregator.close_current_bucket())
+
+    def test_repeated_stop_calls_are_safe_and_idempotent(self):
+        """R-1 Regression: Repeated stop calls must be safe, idempotent, and not raise or re-persist."""
+        self.sm.update_shift_status(ShiftInfo(session_id=1, status=ShiftStatus.ACTIVE))
+        for _ in range(10):
+            self.aggregator.tick(1.0)
+
+        self.aggregator.stop()
+        b = self.aggregator.close_current_bucket()
+        self.assertIsNotNone(b)
+        count1 = self.queue.get_total_bucket_count(allow_unfiltered=True)
+
+        # Second and third stop calls
+        self.aggregator.stop()
+        self.aggregator.stop()
+        self.assertIsNone(self.aggregator.close_current_bucket())
+        count2 = self.queue.get_total_bucket_count(allow_unfiltered=True)
+        self.assertEqual(count1, count2, "Repeated stop calls must not duplicate buckets")
+
+    def test_tick_racing_with_shutdown(self):
+        """R-1 Regression: Concurrent tick calls racing with stop() must not deadlock or corrupt state."""
+        import threading
+        self.sm.update_shift_status(ShiftInfo(session_id=1, status=ShiftStatus.ACTIVE))
+
+        errors = []
+
+        def tick_worker():
+            try:
+                for _ in range(100):
+                    self.aggregator.tick(0.1)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=tick_worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+
+        # Stop while workers are ticking
+        self.aggregator.stop()
+
+        for t in threads:
+            t.join(timeout=5.0)
+
+        self.assertEqual(len(errors), 0, f"Race condition during shutdown threw: {errors}")
+        # Verify subsequent ticks remain blocked
+        self.assertIsNone(self.aggregator.tick(1.0))
+
+    def test_invalid_or_negative_elapsed_duration(self):
+        """Preserves existing guard against invalid or non-positive durations."""
+        self.sm.update_shift_status(ShiftInfo(session_id=1, status=ShiftStatus.ACTIVE))
+        self.assertIsNone(self.aggregator.tick(0.0))
+        self.assertIsNone(self.aggregator.tick(-1.0))
 
 
 if __name__ == "__main__":

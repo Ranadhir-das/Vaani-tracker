@@ -27,13 +27,13 @@ from .win32 import (
     WNDPROC,
     MSG,
     WNDCLASSEXW,
+    WM_QUIT,
+    PM_NOREMOVE,
+    ERROR_CLASS_ALREADY_EXISTS,
     init_win32_prototypes,
 )
 
 logger = logging.getLogger(__name__)
-
-ERROR_CLASS_ALREADY_EXISTS = 1410
-WM_QUIT = 0x0012
 
 
 class WindowsPowerNotifier:
@@ -41,29 +41,44 @@ class WindowsPowerNotifier:
 
     def __init__(self):
         self._is_windows = platform.system() == "Windows"
+        self._state_lock = threading.Lock()
         self._suspend_callbacks: List[Callable[[], None]] = []
         self._resume_callbacks: List[Callable[[], None]] = []
         self._is_sleeping: bool = False
         self._hwnd: Optional[int] = None
         self._thread: Optional[threading.Thread] = None
+        self._thread_id: Optional[int] = None
+        self._ready_event = threading.Event()
+        self._init_error: Optional[Exception] = None
         self._running: bool = False
         self._wnd_proc = None  # Prevents ctypes callback garbage collection
 
     @property
     def is_sleeping(self) -> bool:
-        return self._is_sleeping
+        with self._state_lock:
+            return self._is_sleeping
+
+    @property
+    def is_running(self) -> bool:
+        return self._running and self._thread is not None and self._thread.is_alive()
 
     def on_suspend(self, callback: Callable[[], None]) -> None:
-        self._suspend_callbacks.append(callback)
+        with self._state_lock:
+            self._suspend_callbacks.append(callback)
 
     def on_resume(self, callback: Callable[[], None]) -> None:
-        self._resume_callbacks.append(callback)
+        with self._state_lock:
+            self._resume_callbacks.append(callback)
 
     def trigger_suspend(self) -> None:
         """Explicitly triggers system suspend / sleep event."""
+        with self._state_lock:
+            if self._is_sleeping:
+                return
+            self._is_sleeping = True
+            callbacks = list(self._suspend_callbacks)
         logger.info("System power state changed: ENTERING SLEEP / SUSPEND")
-        self._is_sleeping = True
-        for cb in self._suspend_callbacks:
+        for cb in callbacks:
             try:
                 cb()
             except Exception as e:
@@ -71,38 +86,76 @@ class WindowsPowerNotifier:
 
     def trigger_resume(self) -> None:
         """Explicitly triggers system resume from sleep event."""
+        with self._state_lock:
+            if not self._is_sleeping:
+                return
+            self._is_sleeping = False
+            callbacks = list(self._resume_callbacks)
         logger.info("System power state changed: RESUMED FROM SLEEP")
-        self._is_sleeping = False
-        for cb in self._resume_callbacks:
+        for cb in callbacks:
             try:
                 cb()
             except Exception as e:
                 logger.error(f"Error in power resume callback: {e}", exc_info=True)
 
-    def start(self) -> None:
+    def start(self, timeout: float = 2.0) -> bool:
         """Starts the power broadcast listener thread on Windows."""
         if not self._is_windows:
             logger.info("Non-Windows OS: WindowsPowerNotifier running in simulated mode.")
-            return
+            self._running = True
+            return True
 
-        if self._running:
-            return
+        if self._running and self._thread is not None and self._thread.is_alive():
+            return True
 
         self._running = True
+        self._init_error = None
+        self._ready_event.clear()
         self._thread = threading.Thread(target=self._run_message_loop, daemon=True, name="PowerNotifierThread")
         self._thread.start()
 
-    def stop(self) -> None:
+        ready = self._ready_event.wait(timeout=timeout)
+        if not ready or self._init_error is not None:
+            logger.error(f"Failed to start WindowsPowerNotifier within {timeout}s: {self._init_error}")
+            self.stop(timeout=1.0)
+            return False
+        return True
+
+    def stop(self, timeout: float = 2.0) -> bool:
         """Stops the power listener and terminates the message loop."""
+        if not self._running and (self._thread is None or not self._thread.is_alive()):
+            return True
+
         self._running = False
-        if self._hwnd and self._is_windows:
+
+        if not self._is_windows:
+            return True
+
+        # Ensure listener thread has initialized its queue before posting WM_QUIT
+        self._ready_event.wait(timeout=min(timeout, 1.0))
+
+        if self._thread_id:
             try:
-                ctypes.windll.user32.PostMessageW(self._hwnd, WM_QUIT, 0, 0)
+                user32 = ctypes.windll.user32
+                kernel32 = ctypes.windll.kernel32
+                success = user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
+                if not success:
+                    err = kernel32.GetLastError()
+                    logger.warning(f"PostThreadMessageW WM_QUIT failed in PowerNotifier (err={err})")
             except Exception as e:
-                logger.debug(f"PostMessageW WM_QUIT failed: {e}")
+                logger.debug(f"PostThreadMessageW exception in PowerNotifier: {e}")
+
+        terminated = True
         if self._thread and self._thread.is_alive() and self._thread != threading.current_thread():
-            self._thread.join(timeout=1.5)
-            self._thread = None
+            self._thread.join(timeout=timeout)
+            if self._thread.is_alive():
+                logger.error(f"Power notifier thread failed to terminate within {timeout}s.")
+                terminated = False
+            else:
+                self._thread = None
+                self._thread_id = None
+
+        return terminated
 
     def _run_message_loop(self) -> None:
         """Win32 hidden message window receiving WM_POWERBROADCAST."""
@@ -114,6 +167,12 @@ class WindowsPowerNotifier:
 
             user32 = ctypes.windll.user32
             kernel32 = ctypes.windll.kernel32
+
+            self._thread_id = kernel32.GetCurrentThreadId()
+
+            # Force creation of the thread message queue before signaling readiness
+            dummy_msg = MSG()
+            user32.PeekMessageW(ctypes.byref(dummy_msg), None, 0, 0, PM_NOREMOVE)
 
             def wnd_proc(hwnd, msg, wparam, lparam):
                 try:
@@ -167,6 +226,10 @@ class WindowsPowerNotifier:
                 raise ctypes.WinError(err)
 
             logger.info("Successfully registered Windows power notification listener.")
+            self._init_error = None
+
+            # Queue is established and window registered; signal readiness
+            self._ready_event.set()
 
             msg = MSG()
             p_msg = ctypes.byref(msg)
@@ -182,8 +245,11 @@ class WindowsPowerNotifier:
 
         except Exception as e:
             logger.error(f"Error in WindowsPowerNotifier thread: {e}", exc_info=True)
-            raise
+            self._init_error = e
+            self._ready_event.set()  # Prevent stop() or start() from waiting indefinitely
+            return
         finally:
+            self._ready_event.set()
             if self._hwnd:
                 hwnd_cleanup = self._hwnd
                 self._hwnd = None

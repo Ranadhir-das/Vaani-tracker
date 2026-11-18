@@ -1,6 +1,7 @@
 """Configuration management for Vaani Desktop Tracker."""
 
 import json
+import logging
 import os
 import platform
 import uuid
@@ -17,6 +18,15 @@ from .constants import (
     DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
     DEFAULT_SYNC_INTERVAL_SECONDS,
 )
+from .security.dpapi import (
+    is_dpapi_available,
+    protect_token,
+    unprotect_token,
+    is_protected_token,
+    DPAPIDecryptionError,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def get_default_data_dir() -> Path:
@@ -94,7 +104,35 @@ class TrackerConfig:
         track_apps = str(os.environ.get("VAANI_TRACK_APPS", file_data.get("track_apps", True))).lower() in ("true", "1", "yes")
         log_level = os.environ.get("VAANI_LOG_LEVEL", file_data.get("log_level", "INFO")).upper()
         device_uuid = file_data.get("device_uuid") or str(uuid.uuid4())
-        auth_token = file_data.get("auth_token")
+        raw_token = file_data.get("auth_token")
+        auth_token = None
+        needs_migration = False
+
+        if raw_token:
+            if is_protected_token(raw_token):
+                try:
+                    auth_token = unprotect_token(raw_token)
+                except DPAPIDecryptionError:
+                    logger.warning(
+                        "Stored device authentication token could not be decrypted with Windows DPAPI. "
+                        "The Windows user profile or DPAPI encryption keys may have changed. "
+                        "Workstation credentials cleared for re-pairing."
+                    )
+                    auth_token = None
+            else:
+                # Legacy plaintext token found: fail closed unless it can be securely migrated
+                if is_dpapi_available():
+                    try:
+                        protect_token(raw_token)
+                        auth_token = raw_token
+                        needs_migration = True
+                    except Exception as e:
+                        logger.warning(f"Failed to protect legacy plaintext token with DPAPI; failing closed: {e}")
+                        auth_token = None
+                else:
+                    logger.warning("Windows DPAPI is unavailable; refusing to load or use legacy plaintext token.")
+                    auth_token = None
+
         employee_id = file_data.get("registered_employee_id")
         employee_name = file_data.get("registered_employee_name")
 
@@ -112,14 +150,32 @@ class TrackerConfig:
             registered_employee_name=employee_name,
         )
 
-        # Save to persist newly generated device_uuid if not already saved
-        if not config_path.exists() or "device_uuid" not in file_data:
-            instance.save()
+        # Save to persist newly generated device_uuid or migrate legacy plaintext token to DPAPI
+        if not config_path.exists() or "device_uuid" not in file_data or needs_migration:
+            try:
+                instance.save()
+            except Exception as e:
+                logger.warning(f"Could not persist config on load: {e}")
 
         return instance
 
     def save(self) -> None:
-        """Persists current configuration to disk."""
+        """Persists current configuration to disk with DPAPI-encrypted token.
+
+        Fails closed: never writes plaintext tokens to disk.
+        Uses atomic file replacement via temporary file and os.replace to prevent partial writes.
+        """
+        protected_token = None
+        if self.auth_token:
+            if is_protected_token(self.auth_token):
+                protected_token = self.auth_token
+            elif is_dpapi_available():
+                protected_token = protect_token(self.auth_token)
+            else:
+                raise DPAPIEncryptionError(
+                    "Windows DPAPI is not available; refusing to persist plaintext token to config.json."
+                )
+
         data = {
             "backend_url": self.backend_url,
             "idle_threshold_seconds": self.idle_threshold_seconds,
@@ -128,11 +184,21 @@ class TrackerConfig:
             "track_apps": self.track_apps,
             "log_level": self.log_level,
             "device_uuid": self.device_uuid,
-            "auth_token": self.auth_token,
+            "auth_token": protected_token,
             "registered_employee_id": self.registered_employee_id,
             "registered_employee_name": self.registered_employee_name,
         }
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        with open(self.config_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        temp_path = self.config_path.with_name(f"{self.config_path.name}.tmp.{uuid.uuid4().hex[:8]}")
+        try:
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(temp_path, self.config_path)
+        except Exception:
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except Exception:
+                    pass
+            raise
 

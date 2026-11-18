@@ -67,14 +67,19 @@ A lightweight, privacy-first Windows system-tray application for workforce atten
 E:\react\vaani-tracker\
 ├── README.md               # Architecture and setup guide
 ├── PRIVACY.md              # Official privacy and transparency notice
+├── ROLLOUT_GUIDE.md        # Enterprise rollout guide for IT & Video Editors
+├── RELEASE_NOTES_v1.0.0.md # Version 1.0.0 release notes & checksums
 ├── MANUAL_TESTING.md       # Step-by-step manual test runbook
 ├── config.example.json     # Configuration file template
+├── file_version_info.txt   # Windows executable resource metadata
 ├── requirements.txt        # Runtime dependencies (Pillow, pystray)
 ├── requirements-dev.txt    # Dev & packaging dependencies (PyInstaller)
 ├── run_dev.py              # Development launcher
 ├── mock_server.py          # Standalone local mock Vaani backend
 ├── build_exe.py            # Automated PyInstaller build script
 ├── vaani_tracker.iss       # Inno Setup Windows installer script
+├── assets/                 # Multi-res icons (.ico, .png) and brand logos
+├── dist/                   # Built standalone EXE and Inno Setup installer
 ├── src/
 │   └── vaani_tracker/
 │       ├── __init__.py
@@ -88,8 +93,8 @@ E:\react\vaani-tracker\
 │       ├── client/         # HTTPS API client & device auth manager
 │       ├── windows/        # Native Windows APIs (idle, session, power, apps)
 │       ├── core/           # State machine, 1-min aggregator, background syncer
-│       └── ui/             # System tray icon, menu, and HTML activity summary
-└── tests/                  # 40 comprehensive unit & integration tests
+│       └── ui/             # System tray icon, Desktop Dashboard, First-Run Wizard
+└── tests/                  # 115 comprehensive unit & integration tests
 ```
 
 ---

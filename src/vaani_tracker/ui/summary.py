@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 import html
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import webbrowser
 
 from ..config import TrackerConfig
@@ -32,22 +32,39 @@ def generate_summary_html(
     config: TrackerConfig,
     state_machine: TrackingStateMachine,
     queue: ActivityQueue,
+    auth_manager: Optional[Any] = None,
 ) -> str:
     """Generates the HTML content for the employee transparency activity summary."""
-    now_utc = datetime.now(timezone.utc)
-    today_start_iso = now_utc.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-    stats = queue.get_summary_stats(today_start_iso)
+    # Calculate local calendar day start boundary converted to UTC
+    local_now = datetime.now().astimezone()
+    local_today_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start_iso = local_today_start.astimezone(timezone.utc).isoformat()
 
     shift = state_machine.shift_info
     state = state_machine.current_state
-
-    emp_name = config.registered_employee_name or "Employee"
-    emp_id = config.registered_employee_id or "—"
     device_uuid = config.device_uuid
+
+    if auth_manager is not None:
+        auth_id = auth_manager.get_authenticated_employee_id()
+        if auth_id is not None:
+            bound = auth_manager.get_bound_employee()
+            emp_name = bound.get("employee_name") or config.registered_employee_name or "Employee"
+            emp_id = auth_id
+            stats = queue.get_summary_stats(today_start_iso, employee_id=auth_id)
+            pending_count = queue.get_pending_count(employee_id=auth_id)
+        else:
+            emp_name = "Not Paired"
+            emp_id = "—"
+            stats = {"total_active_seconds": 0, "total_idle_seconds": 0, "app_breakdown": {}}
+            pending_count = 0
+    else:
+        emp_name = config.registered_employee_name or "Employee"
+        emp_id = config.registered_employee_id or "—"
+        stats = queue.get_summary_stats(today_start_iso, employee_id=config.registered_employee_id)
+        pending_count = queue.get_pending_count(employee_id=config.registered_employee_id)
 
     total_active_secs = stats["total_active_seconds"]
     total_idle_secs = stats["total_idle_seconds"]
-    pending_count = queue.get_pending_count()
 
     app_rows = ""
     sorted_apps = sorted(stats["app_breakdown"].items(), key=lambda x: x[1], reverse=True)
@@ -91,7 +108,7 @@ def generate_summary_html(
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Vaani Desktop Tracker · Activity Summary</title>
+  <title>Vaani Desktop Tracker &mdash; Activity Summary</title>
   <style>
     body {{
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -254,7 +271,7 @@ def generate_summary_html(
       <p style="margin: 0; font-size: 13px; color: #94a3b8;">
         Device UUID: <code style="color: #cbd5e1;">{html.escape(device_uuid)}</code><br>
         Backend URL: <code style="color: #cbd5e1;">{html.escape(config.backend_url)}</code><br>
-        Idle Threshold: <strong>{config.idle_threshold_seconds}s</strong> · Sync Interval: <strong>{config.sync_interval_seconds}s</strong>
+        Idle Threshold: <strong>{config.idle_threshold_seconds}s</strong> &bull; Sync Interval: <strong>{config.sync_interval_seconds}s</strong>
       </p>
     </div>
 
@@ -272,9 +289,10 @@ def show_activity_summary(
     config: TrackerConfig,
     state_machine: TrackingStateMachine,
     queue: ActivityQueue,
+    auth_manager: Optional[Any] = None,
 ) -> Path:
     """Writes the summary HTML file to disk and opens it in the system web browser."""
-    content = generate_summary_html(config, state_machine, queue)
+    content = generate_summary_html(config, state_machine, queue, auth_manager=auth_manager)
     summary_path = config.data_dir / "summary.html"
     with open(summary_path, "w", encoding="utf-8") as f:
         f.write(content)

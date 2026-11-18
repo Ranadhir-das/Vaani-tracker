@@ -15,6 +15,8 @@ from ..constants import (
     WTS_SESSION_LOCK,
     WTS_SESSION_UNLOCK,
     WTS_SESSION_LOGOFF,
+    WM_QUERYENDSESSION,
+    WM_ENDSESSION,
 )
 from .win32 import (
     HWND,
@@ -27,14 +29,16 @@ from .win32 import (
     WNDPROC,
     MSG,
     WNDCLASSEXW,
+    WM_QUIT,
+    PM_NOREMOVE,
+    ERROR_CLASS_ALREADY_EXISTS,
+    VAANI_ACTIVATE_MESSAGE,
     init_win32_prototypes,
 )
 
 logger = logging.getLogger(__name__)
 
 NOTIFY_FOR_THIS_SESSION = 0
-ERROR_CLASS_ALREADY_EXISTS = 1410
-WM_QUIT = 0x0012
 
 
 class WindowsSessionNotifier:
@@ -42,82 +46,230 @@ class WindowsSessionNotifier:
 
     def __init__(self):
         self._is_windows = platform.system() == "Windows"
+        self._state_lock = threading.Lock()
         self._lock_callbacks: List[Callable[[], None]] = []
         self._unlock_callbacks: List[Callable[[], None]] = []
         self._logoff_callbacks: List[Callable[[], None]] = []
+        self._query_end_session_callbacks: List[Callable[[], Optional[bool]]] = []
+        self._end_session_callbacks: List[Callable[[bool], None]] = []
+        self._activate_callbacks: List[Callable[[], None]] = []
+        self._activate_msg: int = 0
         self._is_locked: bool = False
+        self._is_logged_off: bool = False
         self._hwnd: Optional[int] = None
         self._thread: Optional[threading.Thread] = None
+        self._thread_id: Optional[int] = None
+        self._ready_event = threading.Event()
+        self._init_error: Optional[Exception] = None
         self._running: bool = False
         self._wnd_proc = None  # Prevents ctypes callback garbage collection
 
     @property
     def is_locked(self) -> bool:
-        return self._is_locked
+        with self._state_lock:
+            return self._is_locked
+
+    @property
+    def is_logged_off(self) -> bool:
+        with self._state_lock:
+            return self._is_logged_off
+
+    @property
+    def is_running(self) -> bool:
+        return self._running and self._thread is not None and self._thread.is_alive()
 
     def on_lock(self, callback: Callable[[], None]) -> None:
-        self._lock_callbacks.append(callback)
+        with self._state_lock:
+            self._lock_callbacks.append(callback)
 
     def on_unlock(self, callback: Callable[[], None]) -> None:
-        self._unlock_callbacks.append(callback)
+        with self._state_lock:
+            self._unlock_callbacks.append(callback)
 
     def on_logoff(self, callback: Callable[[], None]) -> None:
-        self._logoff_callbacks.append(callback)
+        with self._state_lock:
+            self._logoff_callbacks.append(callback)
+
+    def on_query_end_session(self, callback: Callable[[], Optional[bool]]) -> None:
+        with self._state_lock:
+            self._query_end_session_callbacks.append(callback)
+
+    def on_end_session(self, callback: Callable[[bool], None]) -> None:
+        with self._state_lock:
+            self._end_session_callbacks.append(callback)
+
+    def trigger_query_end_session(self, lparam: int = 0) -> bool:
+        """Explicitly triggers query end session callbacks.
+
+        Returns True if all callbacks permit ending the session (or return None),
+        False if any callback explicitly denies (returns False).
+        """
+        with self._state_lock:
+            callbacks = list(self._query_end_session_callbacks)
+        logger.info(f"Session state query: WM_QUERYENDSESSION (lparam=0x{lparam:X})")
+        allow_end = True
+        for cb in callbacks:
+            try:
+                import inspect
+                sig = inspect.signature(cb)
+                if len(sig.parameters) >= 1:
+                    res = cb(lparam)
+                else:
+                    res = cb()
+                if res is False:
+                    allow_end = False
+            except Exception as e:
+                logger.error(f"Error in query_end_session callback: {e}", exc_info=True)
+        return allow_end
+
+    def trigger_end_session(self, is_ending: bool, lparam: int = 0) -> None:
+        """Explicitly triggers end session callbacks."""
+        with self._state_lock:
+            callbacks = list(self._end_session_callbacks)
+        logger.info(f"Session state change: WM_ENDSESSION (is_ending={is_ending}, lparam=0x{lparam:X})")
+        for cb in callbacks:
+            try:
+                import inspect
+                sig = inspect.signature(cb)
+                if len(sig.parameters) >= 2:
+                    cb(is_ending, lparam)
+                elif len(sig.parameters) == 1:
+                    cb(is_ending)
+                else:
+                    cb()
+            except Exception as e:
+                logger.error(f"Error in end_session callback: {e}", exc_info=True)
+
+    def on_activate(self, callback: Callable[[], None]) -> None:
+        """Registers a callback invoked when a secondary instance requests activation."""
+        with self._state_lock:
+            self._activate_callbacks.append(callback)
+
+    def trigger_activate(self) -> None:
+        """Explicitly triggers activation callbacks."""
+        with self._state_lock:
+            callbacks = list(self._activate_callbacks)
+        logger.info("Session state change: EXTERNAL_ACTIVATION_REQUEST")
+        for cb in callbacks:
+            try:
+                cb()
+            except Exception as e:
+                logger.error(f"Error in activate callback: {e}", exc_info=True)
 
     def trigger_lock(self) -> None:
         """Explicitly triggers lock event (also useful for testing/simulation)."""
+        with self._state_lock:
+            if self._is_locked:
+                return
+            self._is_locked = True
+            callbacks = list(self._lock_callbacks)
         logger.info("Session state changed: WORKSTATION LOCKED")
-        self._is_locked = True
-        for cb in self._lock_callbacks:
+        for cb in callbacks:
             try:
                 cb()
             except Exception as e:
                 logger.error(f"Error in lock callback: {e}", exc_info=True)
 
     def trigger_unlock(self) -> None:
-        """Explicitly triggers unlock event (also useful for testing/simulation)."""
+        """Explicitly triggers unlock event for workstation lock/unlock in the current session.
+
+        Note on Windows lifecycle:
+        Workstation lock and unlock occur within the same active user session.
+        Windows logoff ends the interactive user session, stopping local tracking permanently
+        for this process without altering the CRM shift. A subsequent WTS_SESSION_UNLOCK
+        is not treated as a new login; upon a new Windows login, a newly launched tracker
+        process checks the authoritative CRM backend shift before resuming tracking.
+        """
+        with self._state_lock:
+            if not self._is_locked:
+                return
+            self._is_locked = False
+            callbacks = list(self._unlock_callbacks)
         logger.info("Session state changed: WORKSTATION UNLOCKED")
-        self._is_locked = False
-        for cb in self._unlock_callbacks:
+        for cb in callbacks:
             try:
                 cb()
             except Exception as e:
                 logger.error(f"Error in unlock callback: {e}", exc_info=True)
 
     def trigger_logoff(self) -> None:
-        """Explicitly triggers logoff event."""
+        """Explicitly triggers logoff event.
+
+        Windows logoff ends the interactive user session. Tracking stops locally
+        without modifying or completing the CRM shift. Once logged off, this process
+        remains STOPPED; the application must be launched again after a new Windows login.
+        """
+        with self._state_lock:
+            if self._is_logged_off:
+                return
+            self._is_logged_off = True
+            self._is_locked = False
+            callbacks = list(self._logoff_callbacks)
         logger.info("Session state changed: USER LOGOFF")
-        self._is_locked = False
-        for cb in self._logoff_callbacks:
+        for cb in callbacks:
             try:
                 cb()
             except Exception as e:
                 logger.error(f"Error in logoff callback: {e}", exc_info=True)
 
-    def start(self) -> None:
+    def start(self, timeout: float = 2.0) -> bool:
         """Starts the background session notification listener thread on Windows."""
         if not self._is_windows:
             logger.info("Non-Windows OS: WindowsSessionNotifier running in simulated mode.")
-            return
+            self._running = True
+            return True
 
-        if self._running:
-            return
+        if self._running and self._thread is not None and self._thread.is_alive():
+            return True
 
         self._running = True
+        self._init_error = None
+        self._ready_event.clear()
         self._thread = threading.Thread(target=self._run_message_loop, daemon=True, name="SessionNotifierThread")
         self._thread.start()
 
-    def stop(self) -> None:
+        ready = self._ready_event.wait(timeout=timeout)
+        if not ready or self._init_error is not None:
+            logger.error(f"Failed to start WindowsSessionNotifier within {timeout}s: {self._init_error}")
+            self.stop(timeout=1.0)
+            return False
+        return True
+
+    def stop(self, timeout: float = 2.0) -> bool:
         """Stops the notification listener and terminates the message loop."""
+        if not self._running and (self._thread is None or not self._thread.is_alive()):
+            return True
+
         self._running = False
-        if self._hwnd and self._is_windows:
+
+        if not self._is_windows:
+            return True
+
+        # Ensure listener thread has initialized its queue before posting WM_QUIT
+        self._ready_event.wait(timeout=min(timeout, 1.0))
+
+        if self._thread_id:
             try:
-                ctypes.windll.user32.PostMessageW(self._hwnd, WM_QUIT, 0, 0)
+                user32 = ctypes.windll.user32
+                kernel32 = ctypes.windll.kernel32
+                success = user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
+                if not success:
+                    err = kernel32.GetLastError()
+                    logger.warning(f"PostThreadMessageW WM_QUIT failed in SessionNotifier (err={err})")
             except Exception as e:
-                logger.debug(f"PostMessageW WM_QUIT failed: {e}")
+                logger.debug(f"PostThreadMessageW exception in SessionNotifier: {e}")
+
+        terminated = True
         if self._thread and self._thread.is_alive() and self._thread != threading.current_thread():
-            self._thread.join(timeout=1.5)
-            self._thread = None
+            self._thread.join(timeout=timeout)
+            if self._thread.is_alive():
+                logger.error(f"Session notifier thread failed to terminate within {timeout}s.")
+                terminated = False
+            else:
+                self._thread = None
+                self._thread_id = None
+
+        return terminated
 
     def _run_message_loop(self) -> None:
         """Win32 hidden message window receiving WTSSessionNotification."""
@@ -131,15 +283,37 @@ class WindowsSessionNotifier:
             kernel32 = ctypes.windll.kernel32
             wtsapi32 = ctypes.windll.wtsapi32
 
+            self._thread_id = kernel32.GetCurrentThreadId()
+
+            try:
+                self._activate_msg = user32.RegisterWindowMessageW(VAANI_ACTIVATE_MESSAGE)
+            except Exception as e:
+                logger.debug(f"Failed to register activation message: {e}")
+                self._activate_msg = 0
+
+            # Force creation of the thread message queue before signaling readiness
+            dummy_msg = MSG()
+            user32.PeekMessageW(ctypes.byref(dummy_msg), None, 0, 0, PM_NOREMOVE)
+
             def wnd_proc(hwnd, msg, wparam, lparam):
                 try:
-                    if msg == WM_WTSSESSION_CHANGE:
+                    if self._activate_msg and msg == self._activate_msg:
+                        self.trigger_activate()
+                        return 1
+                    elif msg == WM_WTSSESSION_CHANGE:
                         if wparam == WTS_SESSION_LOCK:
                             self.trigger_lock()
                         elif wparam == WTS_SESSION_UNLOCK:
                             self.trigger_unlock()
                         elif wparam == WTS_SESSION_LOGOFF:
                             self.trigger_logoff()
+                        return 0
+                    elif msg == WM_QUERYENDSESSION:
+                        can_end = self.trigger_query_end_session(lparam)
+                        return 1 if can_end else 0
+                    elif msg == WM_ENDSESSION:
+                        is_ending = bool(wparam)
+                        self.trigger_end_session(is_ending, lparam)
                         return 0
                     return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
                 except Exception as e:
@@ -189,6 +363,10 @@ class WindowsSessionNotifier:
                 raise ctypes.WinError(err)
 
             logger.info("Successfully registered Windows session change notification listener.")
+            self._init_error = None
+
+            # Queue is established and window registered; signal readiness
+            self._ready_event.set()
 
             msg = MSG()
             p_msg = ctypes.byref(msg)
@@ -204,8 +382,11 @@ class WindowsSessionNotifier:
 
         except Exception as e:
             logger.error(f"Error in WindowsSessionNotifier thread: {e}", exc_info=True)
-            raise
+            self._init_error = e
+            self._ready_event.set()  # Prevent stop() or start() from waiting indefinitely
+            return
         finally:
+            self._ready_event.set()
             if self._hwnd:
                 hwnd_cleanup = self._hwnd
                 self._hwnd = None

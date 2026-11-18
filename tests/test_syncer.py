@@ -56,19 +56,19 @@ class TestBackgroundSyncer(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_sync_pending_success(self):
-        bucket = ActivityBucket(bucket_id="b-sync-1", device_uuid="dev-test-sync", active_seconds=60)
-        self.queue.save_bucket(bucket)
-        self.assertEqual(self.queue.get_pending_count(), 1)
+        bucket = ActivityBucket(bucket_id="b-sync-1", device_uuid="dev-test-sync", employee_id=1, active_seconds=60)
+        self.queue.save_bucket(bucket, employee_id=1)
+        self.assertEqual(self.queue.get_pending_count(employee_id=1), 1)
 
         self.mock_api.sync_buckets.return_value = SyncResult(success=True, synced_count=1)
 
         res = self.syncer.sync_pending_now()
         self.assertTrue(res.success)
-        self.assertEqual(self.queue.get_pending_count(), 0)
+        self.assertEqual(self.queue.get_pending_count(employee_id=1), 0)
 
     def test_sync_token_revoked_clears_credentials(self):
-        bucket = ActivityBucket(bucket_id="b-rev-1", device_uuid="dev-test-sync", active_seconds=60)
-        self.queue.save_bucket(bucket)
+        bucket = ActivityBucket(bucket_id="b-rev-1", device_uuid="dev-test-sync", employee_id=1, active_seconds=60)
+        self.queue.save_bucket(bucket, employee_id=1)
 
         self.mock_api.sync_buckets.return_value = SyncResult(
             success=False,
@@ -90,6 +90,74 @@ class TestBackgroundSyncer(unittest.TestCase):
         self.assertTrue(online)
         self.assertEqual(self.sm.shift_info.session_id, 200)
         self.assertEqual(self.sm.current_state, TrackerState.ACTIVE)
+
+    def test_start_does_not_create_duplicate_threads(self):
+        """Repeated start() calls do not spawn duplicate worker threads."""
+        self.syncer.start()
+        self.assertTrue(self.syncer.is_running)
+        sync_th = self.syncer._sync_thread
+        hb_th = self.syncer._heartbeat_thread
+
+        # Second call to start() must be an idempotent no-op
+        self.syncer.start()
+        self.assertIs(self.syncer._sync_thread, sync_th)
+        self.assertIs(self.syncer._heartbeat_thread, hb_th)
+
+        self.syncer.stop()
+        self.assertFalse(self.syncer.is_running)
+
+    def test_worker_reference_preserved_if_stop_times_out(self):
+        """Worker reference is preserved if stop_sync fails to terminate the thread."""
+        import threading
+        hung_event = threading.Event()
+
+        def hung_worker():
+            hung_event.wait(timeout=2.0)
+
+        hung_thread = threading.Thread(target=hung_worker, daemon=True)
+        hung_thread.start()
+
+        # Inject hung thread as sync worker
+        self.syncer._sync_thread = hung_thread
+        self.syncer._running = True
+        self.syncer._sync_worker_running = True
+
+        try:
+            stopped = self.syncer.stop_sync(timeout=0.05)
+            self.assertFalse(stopped, "stop_sync must return False when worker thread does not terminate")
+            # Worker reference must NOT be discarded
+            self.assertIs(self.syncer._sync_thread, hung_thread)
+            self.assertTrue(self.syncer.is_running)
+        finally:
+            hung_event.set()
+            hung_thread.join(timeout=1.0)
+            self.syncer._sync_thread = None
+            self.syncer.stop()
+
+    def test_concurrent_start_and_stop_lifecycle(self):
+        """Concurrent calls to start() and stop() do not race, corrupt state, or deadlock."""
+        import threading
+
+        errors = []
+
+        def worker_cycle():
+            try:
+                for _ in range(10):
+                    self.syncer.start()
+                    self.syncer.stop(timeout=0.5)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker_cycle) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5.0)
+
+        self.assertEqual(len(errors), 0, f"Concurrent lifecycle operations threw: {errors}")
+        # Final cleanup
+        self.syncer.stop()
+        self.assertFalse(self.syncer.is_running)
 
 
 if __name__ == "__main__":
